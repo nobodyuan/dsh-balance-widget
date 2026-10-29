@@ -72,6 +72,20 @@
 | `autoHide` | 贴边后是否自动隐藏（鼠标移开缩边、移上去滑出），默认 `true` |
 | `hangPx` | 隐藏后留在屏幕上的窄边宽度（像素），默认 8 |
 | `hideDelayMs` | 鼠标移开后多久缩边（毫秒），默认 450 |
+| `nodePath` | 可选。手动指定 `node.exe` 路径（Node 22.15+），一般不用填，见下方「明细读不到数据」 |
+
+### 明细读不到数据 / 提示需要 Node
+
+明细窗口要靠 Node 解压会话日志（zstd）。dsh 是从资源管理器拉起来的，**PATH 里通常没有 node**，所以插件会：
+
+1. 自己找一个能用的 Node（`~/.dsh/dsh-runtimes/*/dependencies/node/bin/node.exe` → 系统安装 → `~/.workbuddy/binaries/node/versions/*`）
+2. 把路径写进 `%LOCALAPPDATA%\BalanceWidget\node.txt`，悬浮窗优先读它
+
+如果窗口里仍然提示找不到 Node：
+
+- 在 `config.json` 里加 `"nodePath": "C:\\路径\\node.exe"`（任意 Node 22.15+ 都行，dsh 自带的那个就可以）
+- 或者装一个 Node 22+ 到默认位置
+- 详细原因看 `%LOCALAPPDATA%\BalanceWidget\widget.log`（搜 `node` / `扫描`）
 
 ### WorkBuddy Cookie 获取方法
 
