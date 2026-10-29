@@ -225,6 +225,16 @@ $win.Add_MouseRightButtonUp({
     $i2.Add_Click({ $script:topmost = -not $script:topmost; $win.Topmost = $script:topmost }); [void]$menu.Items.Add($i2)
     $i3 = New-Object Windows.Controls.MenuItem; $i3.Header = '打开配置文件'
     $i3.Add_Click({ Start-Process notepad.exe $cfgPath }); [void]$menu.Items.Add($i3)
+    $i35 = New-Object Windows.Controls.MenuItem; $i35.Header = '停用跟随启动(下次dsh不再出现)'
+    $i35.Add_Click({
+        try {
+            $c = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $c | Add-Member -NotePropertyName enabled -NotePropertyValue $false -Force
+            $c | ConvertTo-Json -Depth 5 | Set-Content -Path $cfgPath -Encoding UTF8
+            Write-Log "用户已停用跟随启动 (enabled=false)"
+        } catch { Write-Log ("停用写入失败: " + $_.Exception.Message) }
+        $win.Close()
+    }); [void]$menu.Items.Add($i35)
     $i4 = New-Object Windows.Controls.MenuItem; $i4.Header = '退出'
     $i4.Add_Click({ $win.Close() }); [void]$menu.Items.Add($i4)
     $win.ContextMenu = $menu
