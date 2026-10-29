@@ -10,7 +10,7 @@
  * - dsh 退出时（ctx.effect 清理）不杀悬浮窗，用户可能仍想看着余额。
  */
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,22 @@ function launchWidget(logger) {
     if (!existsSync(SCRIPT_PATH)) {
       log("脚本不存在，跳过: " + SCRIPT_PATH);
       return;
+    }
+
+    // 用户开关：config.json 的 enabled 字段（悬浮窗右键「停用跟随启动」写入）
+    const cfgPath = join(LOG_DIR, "config.json");
+    if (existsSync(cfgPath)) {
+      try {
+        // PowerShell 写出的 UTF-8 带 BOM，必须先剥离再 JSON.parse
+        const raw = readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
+        const cfg = JSON.parse(raw);
+        if (cfg.enabled === false) {
+          log("开关为关 (enabled=false)，跳过启动。重新开启：把 config.json 的 enabled 改回 true");
+          return;
+        }
+      } catch (e) {
+        log("读取开关配置失败，按默认开启处理: " + String(e));
+      }
     }
 
     // 注意：不能用 node 的 detached spawn 直接启动 powershell ——
