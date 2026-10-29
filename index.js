@@ -120,13 +120,26 @@ function usageText() {
   const s = d.sum;
   const lines = [];
   lines.push(`dsh 累计用量（本地会话日志估算）`);
-  lines.push(`花费 ${money(s.cost)} · tokens ${n0(s.totalTokens)} · 请求 ${n0(s.steps)} 次 · 会话 ${n0(s.usedSessions)} 个`);
+  const today = s.todayCost != null ? `（今日 ${money(s.todayCost)} / ${n0(s.todaySteps)} 次）` : "";
+  lines.push(`花费 ${money(s.cost)}${today} · tokens ${n0(s.totalTokens)} · 请求 ${n0(s.steps)} 次 · 会话 ${n0(s.usedSessions)} 个`);
   lines.push(`输入 ${n0(s.inputTokens)}（缓存命中 ${n0(s.cacheReadTokens)}）· 输出 ${n0(s.outputTokens)}`);
 
-  const rows = (d.sessions || []).filter((x) => x.steps > 0).slice(0, 10);
+  if (Array.isArray(d.models) && d.models.length) {
+    lines.push("");
+    lines.push("按模型：" + d.models.map((m) => `${m.model} ${money(m.cost)}（${n0(m.steps)} 次）`).join(" · "));
+  }
+  if (Array.isArray(d.daily) && d.daily.length) {
+    lines.push("按天（最近 7 天）：");
+    d.daily.slice(0, 7).forEach((x) => {
+      const barLen = Math.min(20, Math.round((x.cost / Math.max(0.01, d.daily[0].cost)) * 20));
+      lines.push(`  ${x.date}  ${money(x.cost).padStart(8)}  ${"▇".repeat(Math.max(1, barLen))}  ${n0(x.steps)} 次`);
+    });
+  }
+
+  const rows = (d.sessions || []).filter((x) => x.steps > 0).slice(0, 8);
   if (rows.length) {
     lines.push("");
-    lines.push("最近消耗 top10：");
+    lines.push("最近消耗 top8：");
     rows.forEach((x, i) => {
       const t = x.lastTime ? new Date(x.lastTime).toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "--";
       const task = (x.firstUser || x.title || "(未命名会话)").slice(0, 34);
@@ -135,6 +148,7 @@ function usageText() {
   }
   lines.push("");
   lines.push("费用按 DeepSeek 官方峰谷价估算，仅供参考；精确账单看 platform.deepseek.com。");
+  lines.push("桌面悬浮窗上单击 dsh 那一行可以点开图形化明细（按会话/天/模型/工作区）。");
   return lines.join("\n");
 }
 
