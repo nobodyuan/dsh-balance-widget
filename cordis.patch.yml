@@ -1,0 +1,5 @@
+# dsh-balance-widget 的 bundle patch —— 把「余额悬浮窗启动器」挂进 DSH 配置树
+# 与 dsh-pet 同层加载：desktop profile 启动（桌宠出现）时，本插件随之生效。
+- insert:
+    - id: dsh-balance-widget
+      name: 'dsh-balance-widget'
