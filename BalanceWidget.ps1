@@ -1,7 +1,12 @@
 ﻿# BalanceWidget - 桌面余额悬浮窗 (PowerShell + WPF, 无需编译)
 # 显示: WorkBuddy 算力余额 + DeepSeek(dsh) 余额/总额, 每5分钟刷新, 按余量变色
-# 交互: 拖动(靠近屏幕边缘自动吸附) / 单击 dsh 行看用量明细 / 双击刷新 / 右键菜单
-# 启动: powershell -ExecutionPolicy Bypass -File BalanceWidget.ps1
+# 交互: 拖动(靠近屏幕边缘自动吸附/自动隐藏) / 单击 dsh 行看用量明细 / 双击刷新 / 右键菜单
+# 启动: powershell -ExecutionPolicy Bypass -File BalanceWidget.ps1 [-NodePath <node.exe>]
+#       -NodePath 由 dsh 插件传入（它自己就是 Node 运行时），省得依赖系统 PATH
+
+param(
+    [string]$NodePath = ''
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -35,7 +40,7 @@ $posPath = Join-Path $cfgDir 'pos.txt'
 $usagePath = Join-Path $cfgDir 'usage.json'
 
 if (-not (Test-Path $cfgPath)) {
-    @{ workbuddyCookie = ''; deepseekApiKey = ''; refreshMinutes = 5; deepseekTotal = 0; dailyBudget = 0; snapPx = 26; autoHide = $true; hangPx = 6; hideDelayMs = 450; enabled = $true } |
+    @{ workbuddyCookie = ''; deepseekApiKey = ''; refreshMinutes = 5; deepseekTotal = 0; dailyBudget = 0; snapPx = 26; autoHide = $true; hangPx = 6; hideDelayMs = 450; nodePath = ''; enabled = $true } |
         ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
 }
 $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -59,7 +64,7 @@ $autoHide = $true
 if ($null -ne $cfg.autoHide) { $autoHide = [bool]$cfg.autoHide }
 $hangPx = if ($null -ne $cfg.hangPx) { [int]$cfg.hangPx } else { 6 }
 $hideDelayMs = if ($null -ne $cfg.hideDelayMs) { [int]$cfg.hideDelayMs } else { 450 }
-$script:widgetVersion = '1.3.0'
+$script:widgetVersion = '1.3.1'
 $wbUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0'
 
 function Save-Config {
@@ -95,13 +100,74 @@ $cache = Read-Cache
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ---------- dsh 用量统计（读本地会话日志） ----------
+# 找 Node：悬浮窗是 dsh 拉起来的，PATH 里通常没有 node（本机 node 只在 WorkBuddy 的私有目录里），
+# 所以优先级 = 插件传入 > 配置指定 > 环境变量 > PATH > 注册表 PATH > 各常见安装位置。
+$script:nodeExe = $null
+$script:usageError = ''
+
 function Get-NodePath {
+    $tries = New-Object System.Collections.Generic.List[string]
+    # dsh 插件每次启动都会把它的 Node 路径写进 node.txt（最可靠的一条路）
+    try {
+        $hint = Join-Path $cfgDir 'node.txt'
+        if (Test-Path -LiteralPath $hint) {
+            $hp = (Get-Content -LiteralPath $hint -Raw -Encoding UTF8).Trim()
+            if ($hp) { $tries.Add($hp) }
+        }
+    } catch { }
+    foreach ($c in @($NodePath, [string]$cfg.nodePath, [string]$env:BW_NODE)) {
+        if ($c -and $c.Trim()) { $tries.Add($c.Trim()) }
+    }
     $c = Get-Command node -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    foreach ($p in @("$env:ProgramFiles\nodejs\node.exe", "$env:LOCALAPPDATA\Programs\nodejs\node.exe", "$env:ProgramFiles(x86)\nodejs\node.exe")) {
-        if ($p -and (Test-Path $p)) { return $p }
+    if ($c) { $tries.Add($c.Source) }
+
+    # 注册表里的 PATH（进程 PATH 不完整时兜底）
+    foreach ($scope in @('Machine', 'User')) {
+        try {
+            $rp = [Environment]::GetEnvironmentVariable('Path', $scope)
+            if ($rp) {
+                foreach ($seg in ($rp -split ';')) {
+                    if ($seg -and $seg.Trim()) { $tries.Add((Join-Path $seg.Trim() 'node.exe')) }
+                }
+            }
+        } catch { }
+    }
+
+    $tries.Add("$env:ProgramFiles\nodejs\node.exe")
+    $tries.Add("${env:ProgramFiles(x86)}\nodejs\node.exe")
+    $tries.Add("$env:LOCALAPPDATA\Programs\nodejs\node.exe")
+    $tries.Add("$env:APPDATA\npm\node.exe")
+
+    foreach ($t in $tries) {
+        if ($t -and (Test-Path -LiteralPath $t -PathType Leaf)) { return $t }
+    }
+
+    # 带版本号的目录：dsh 自带运行时 / WorkBuddy 自带 node / scoop
+    $globs = @(
+        "$env:USERPROFILE\.dsh\dsh-runtimes\*\dependencies\node\bin\node.exe",
+        "$env:USERPROFILE\.dsh\runtimes\*\dependencies\node\bin\node.exe",
+        "$env:USERPROFILE\.workbuddy\binaries\node\versions\*\node.exe",
+        "$env:USERPROFILE\scoop\apps\nodejs\current\node.exe",
+        "$env:LOCALAPPDATA\fnm\node-versions\*\installation\node.exe"
+    )
+    foreach ($g in $globs) {
+        try {
+            $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($hit) { return $hit.FullName }
+        } catch { }
     }
     return $null
+}
+
+# 兼容 Electron 的可执行文件：需要 ELECTRON_RUN_AS_NODE=1 才会当 node 跑脚本
+function Invoke-NodeScript([string]$exe, [string[]]$argv) {
+    $isElectron = ([System.IO.Path]::GetFileName($exe) -match '^electron')
+    if ($isElectron) { [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', '1') }
+    try {
+        $null = & $exe @argv 2>&1
+    } finally {
+        if ($isElectron) { [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $null) }
+    }
 }
 
 $script:usageCache = $null
@@ -116,26 +182,40 @@ function Get-UsageData([bool]$force) {
             try {
                 $d = Get-Content $usagePath -Raw -Encoding UTF8 | ConvertFrom-Json
                 $script:usageCache = @{ at = Get-Date; data = $d }
+                $script:usageError = ''
                 return $d
             } catch { }
         }
     }
-    $node = Get-NodePath
+    if (-not $script:nodeExe) { $script:nodeExe = Get-NodePath }
+    $node = $script:nodeExe
     $scanner = Join-Path $PSScriptRoot 'usage-scan.cjs'
-    if (-not $node) { Write-Log "未找到 node，跳过用量扫描"; return $script:usageCache.data }
-    if (-not (Test-Path $scanner)) { Write-Log "用量扫描脚本缺失: $scanner"; return $script:usageCache.data }
+    if (-not $node) {
+        $script:usageError = "找不到 Node 运行时（PATH 里没有 node，插件也没传 -NodePath）。`n`n不想装 Node 的话：在 config.json 里加一行 `"nodePath`": `"C:\\...\\node.exe`" 指向任意 Node 22+ 即可。"
+        Write-Log "未找到 node，跳过用量扫描"
+        return $script:usageCache.data
+    }
+    if (-not (Test-Path -LiteralPath $scanner)) {
+        $script:usageError = "用量扫描脚本缺失：$scanner"
+        Write-Log $script:usageError
+        return $script:usageCache.data
+    }
     $sessionsDir = Join-Path $env:USERPROFILE '.dsh\sessions'
     try {
         # 不输出到 stdout，避免阻塞；结果写文件
-        $null = & $node $scanner $sessionsDir $usagePath '--detail' 2>&1
-        if (Test-Path $usagePath) {
+        Invoke-NodeScript $node @($scanner, $sessionsDir, $usagePath, '--detail')
+        if (Test-Path -LiteralPath $usagePath) {
             $d = Get-Content $usagePath -Raw -Encoding UTF8 | ConvertFrom-Json
             $script:usageCache = @{ at = Get-Date; data = $d }
-            Write-Log ("用量扫描完成: 会话={0} 请求={1} 估算=¥{2}" -f $d.sum.usedSessions, $d.sum.steps, $d.sum.cost)
+            $script:usageError = ''
+            Write-Log ("用量扫描完成: node=$node 会话={0} 请求={1} 估算=¥{2}" -f $d.sum.usedSessions, $d.sum.steps, $d.sum.cost)
             return $d
         }
+        $script:usageError = "扫描没有产出结果（node=$node）"
+        Write-Log $script:usageError
     } catch {
-        Write-Log "用量扫描失败: $($_.Exception.Message)"
+        $script:usageError = "扫描失败（node=$node）：$($_.Exception.Message)"
+        Write-Log $script:usageError
     }
     return $script:usageCache.data
 }
@@ -380,9 +460,11 @@ function Show-UsageWindow {
         return
     }
     $data = Get-UsageData $false
+    # 读不到数据也照样把窗口开出来，把原因写在标题区里（比弹一个看不懂的 MessageBox 好排查）
+    $loadErr = ''
     if (-not $data -or -not $data.sum) {
-        [System.Windows.MessageBox]::Show("读不到 dsh 会话数据。`n`n需要本机有 Node 22+（用于解压 ~/.dsh/sessions 里的日志），`n并用过一次 dsh 产生会话记录。", 'dsh 用量明细') | Out-Null
-        return
+        $loadErr = if ($script:usageError) { $script:usageError } else { '读不到 dsh 会话数据（~/.dsh/sessions 里没有可用记录）' }
+        $data = $null
     }
 
     $ux = @"
@@ -529,14 +611,9 @@ function Show-UsageWindow {
         } catch { }
     })
 
-    $uw.FindName('URefresh').Add_Click({
-        try {
-            $script:uData = Get-UsageData $true
-            if ($script:uData -and $script:uData.sum) { Fill-UsageSessions }
-        } catch { }
-    })
     $uw.FindName('UExport').Add_Click({
         try {
+            if (-not $script:uData) { return }
             $rows = @()
             foreach ($s in @($script:uData.sessions | Where-Object { $_.steps -gt 0 })) {
                 $name = if ($s.firstUser) { $s.firstUser } elseif ($s.title) { $s.title } else { '(未命名会话)' }
@@ -560,6 +637,30 @@ function Show-UsageWindow {
 
     # 先挂好事件，再填数据 —— 这样 Fill 里自动选中首行会触发明细填充
     Fill-UsageSessions
+
+    if ($loadErr) {
+        $script:uHead.Text = '读不到 dsh 会话数据'
+        $script:uSub.Text = $loadErr + "`n`n" +
+        "排查顺序：`n" +
+        "1) 点「重新扫描」再试一次；`n" +
+        "2) 看 %LOCALAPPDATA%\BalanceWidget\widget.log 里搜索 node/扫描 相关的行；`n" +
+        "3) 在 config.json 里加一行 `"nodePath`": `"C:\\路径\\node.exe`" 指向任意 Node 22+（dsh 自带的那个也行）；`n" +
+        "4) 确认 ~/.dsh/sessions 里存在 session-*/session.v4.jsonl.zstd。"
+        $script:uFilter.IsEnabled = $false
+    }
+
+    # 重新扫描成功后把头部恢复成正常文案
+    $uw.FindName('URefresh').Add_Click({
+        try {
+            $script:uData = Get-UsageData $true
+            if ($script:uData -and $script:uData.sum) {
+                $script:uFilter.IsEnabled = $true
+                Fill-UsageSessions
+            } else {
+                $script:uSub.Text = $(if ($script:usageError) { $script:usageError } else { '仍然读不到数据' })
+            }
+        } catch { }
+    })
 
     [void]$uw.ShowDialog()
 }
@@ -594,6 +695,15 @@ $xaml = @"
 $win = [Windows.Markup.XamlReader]::Parse($xaml)
 $wbVal = $win.FindName('WbVal'); $dsVal = $win.FindName('DsVal'); $status = $win.FindName('Status')
 $dsRow = $win.FindName('DsRow')
+
+# 打开明细窗口（防抖：一次点击可能被两条路径同时触发）
+$script:lastUsageOpen = [DateTime]::MinValue
+function Open-UsageOnce {
+    $now = Get-Date
+    if (($now - $script:lastUsageOpen).TotalMilliseconds -lt 800) { return }
+    $script:lastUsageOpen = $now
+    Show-UsageWindow
+}
 
 # 记住位置
 if (Test-Path $posPath) {
@@ -777,7 +887,7 @@ $win.Add_MouseLeftButtonDown({
             # 判定为「单击」：落点在 dsh 行内就打开用量明细
             $p = [System.Windows.Input.Mouse]::GetPosition($dsRow)
             if ($p.X -ge 0 -and $p.Y -ge 0 -and $p.X -le $dsRow.ActualWidth -and $p.Y -le $dsRow.ActualHeight) {
-                Show-UsageWindow
+                Open-UsageOnce
                 return
             }
         }
@@ -789,6 +899,15 @@ $win.Add_MouseLeftButtonDown({
     }
 })
 $win.Add_MouseDoubleClick({ Update-All })
+
+# 兜底：DragMove 有时会吃掉 MouseLeftButtonUp，直接在 dsh 行上再挂一道（只挂一次）
+$dsRow.Add_MouseLeftButtonUp({
+    try {
+        $dx2 = [Math]::Abs([System.Windows.Forms.Cursor]::Position.X - $script:downX)
+        $dy2 = [Math]::Abs([System.Windows.Forms.Cursor]::Position.Y - $script:downY)
+        if ($dx2 -lt 5 -and $dy2 -lt 5) { Open-UsageOnce }
+    } catch { }
+})
 
 function Set-DsTotal {
     $cur = 0
@@ -832,7 +951,7 @@ $win.Add_MouseRightButtonUp({
     $i1 = New-Object Windows.Controls.MenuItem; $i1.Header = '刷新余额'
     $i1.Add_Click({ Update-All }); [void]$menu.Items.Add($i1)
     $i2 = New-Object Windows.Controls.MenuItem; $i2.Header = 'dsh 用量明细…'
-    $i2.Add_Click({ Show-UsageWindow }); [void]$menu.Items.Add($i2)
+    $i2.Add_Click({ Open-UsageOnce }); [void]$menu.Items.Add($i2)
     $i3 = New-Object Windows.Controls.MenuItem; $i3.Header = '设置 dsh 总额（赠送+充值）…'
     $i3.Add_Click({ Set-DsTotal }); [void]$menu.Items.Add($i3)
     $i9 = New-Object Windows.Controls.MenuItem; $i9.Header = '设置今日预算（超了变橙）…'
