@@ -32,26 +32,29 @@ function log(msg) {
   } catch { }
 }
 
-function launchWidget(logger) {
+function launchWidget(logger, force = false) {
   try {
     if (!existsSync(SCRIPT_PATH)) {
       log("脚本不存在，跳过: " + SCRIPT_PATH);
-      return;
+      return false;
     }
 
     // 用户开关：config.json 的 enabled 字段（悬浮窗右键「停用跟随启动」写入）
-    const cfgPath = join(LOG_DIR, "config.json");
-    if (existsSync(cfgPath)) {
-      try {
-        // PowerShell 写出的 UTF-8 带 BOM，必须先剥离再 JSON.parse
-        const raw = readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
-        const cfg = JSON.parse(raw);
-        if (cfg.enabled === false) {
-          log("开关为关 (enabled=false)，跳过启动。重新开启：把 config.json 的 enabled 改回 true");
-          return;
+    // /widget 手动命令带 force=true，无视开关直接打开
+    if (!force) {
+      const cfgPath = join(LOG_DIR, "config.json");
+      if (existsSync(cfgPath)) {
+        try {
+          // PowerShell 写出的 UTF-8 带 BOM，必须先剥离再 JSON.parse
+          const raw = readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
+          const cfg = JSON.parse(raw);
+          if (cfg.enabled === false) {
+            log("开关为关 (enabled=false)，跳过自动启动。可用 /widget 命令手动打开");
+            return false;
+          }
+        } catch (e) {
+          log("读取开关配置失败，按默认开启处理: " + String(e));
         }
-      } catch (e) {
-        log("读取开关配置失败，按默认开启处理: " + String(e));
       }
     }
 
@@ -83,6 +86,25 @@ function launchWidget(logger) {
 
 export function apply(ctx) {
   const logger = ctx?.logger;
+
+  // 注册 /widget 斜杠命令：在 dsh 输入框输入 /widget 即可手动打开悬浮窗
+  // （无视 enabled 开关；若悬浮窗已在运行则因单实例锁不会重复出现）
+  try {
+    ctx?.effect?.(() => ctx?.commands?.register({
+      name: "widget",
+      description: "打开余额悬浮窗（WorkBuddy 算力 + DeepSeek 余额）",
+      handler: () => {
+        const launched = launchWidget(logger, true);
+        return {
+          kind: "success",
+          text: launched !== false
+            ? "已发起打开余额悬浮窗（若桌面未出现，查看 %LOCALAPPDATA%\\BalanceWidget\\widget.log）"
+            : "启动脚本缺失，无法打开悬浮窗",
+        };
+      },
+    }), "dsh-balance-widget: /widget command");
+  } catch { /* 宿主不支持命令注册时静默降级 */ }
+
   log("插件已加载，3 秒后启动悬浮窗");
 
   // 宿主就绪后再拉，避免和 dsh 自身的窗口启动抢资源
