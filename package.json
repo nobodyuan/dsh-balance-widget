@@ -1,0 +1,17 @@
+{
+  "name": "dsh-balance-widget",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "随 dsh 桌宠（desktop profile）一起启动余额悬浮窗：显示 WorkBuddy 算力与 DeepSeek 余额。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
