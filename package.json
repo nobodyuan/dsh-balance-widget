@@ -1,6 +1,6 @@
 {
   "name": "dsh-balance-widget",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "private": true,
   "type": "module",
   "description": "随 dsh 桌宠（desktop profile）一起启动余额悬浮窗：贴边自动隐藏、显示 WorkBuddy 算力与 DeepSeek 余额/总额、今日花费，并可查看每个会话的 token 消耗明细。",
