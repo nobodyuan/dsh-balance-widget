@@ -31,12 +31,48 @@ const SCAN_PATH = join(HERE, "usage-scan.cjs");
 const LOG_DIR = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "BalanceWidget");
 const LOG_PATH = join(LOG_DIR, "plugin.log");
 const USAGE_PATH = join(LOG_DIR, "usage.json");
+const INSTANCE_PATH = join(LOG_DIR, "instance.json");
+
+/** 必须与 BalanceWidget.ps1 里的 $script:widgetVersion 保持一致 */
+const WIDGET_VERSION = "1.3.0";
 
 function log(msg) {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
     appendFileSync(LOG_PATH, `${new Date().toLocaleString("zh-CN", { hour12: false })} [dsh-balance-widget] ${msg}\n`, "utf8");
   } catch { }
+}
+
+/** 悬浮窗启动时会写下 { pid, version }，用来判断桌面上跑的是不是旧脚本 */
+function readInstance() {
+  try {
+    if (!existsSync(INSTANCE_PATH)) return null;
+    return JSON.parse(readFileSync(INSTANCE_PATH, "utf8").replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+}
+
+function isAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 结束所有 BalanceWidget.ps1 进程（升级后旧窗口仍占着单实例锁，不杀就换不掉） */
+function killExisting(logger) {
+  try {
+    const ps = `Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*BalanceWidget.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    execFileSync("powershell.exe", ["-NoProfile", "-Command", ps], { windowsHide: true, timeout: 20000, stdio: "ignore" });
+    log("已结束旧的悬浮窗进程");
+    try { logger?.info?.("[dsh-balance-widget] 已结束旧版悬浮窗，准备启动新版本"); } catch { }
+  } catch (e) {
+    log("结束旧进程失败: " + String(e));
+  }
 }
 
 function readEnabled() {
@@ -56,38 +92,55 @@ function launchWidget(logger, force = false) {
   try {
     if (!existsSync(SCRIPT_PATH)) {
       log("脚本不存在，跳过: " + SCRIPT_PATH);
-      return false;
+      return "missing";
     }
     // 用户开关：config.json 的 enabled 字段（悬浮窗右键「停用跟随启动」写入）
     // /widget 手动命令带 force=true，无视开关直接打开
     if (!force && !readEnabled()) {
       log("开关为关 (enabled=false)，跳过自动启动。可用 /widget 命令手动打开");
-      return false;
+      return "disabled";
     }
 
-    // 注意：不能用 node 的 detached spawn 直接启动 powershell ——
-    // Windows 上 detached 模式会让 powershell 立即静默退出(exit 0)。
-    // 改用 Start-Process 中转：由 Win32 CreateProcess 原生分离，绝对可靠。
-    const helper = spawn(
-      "powershell.exe",
-      [
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList ` +
-        `'-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','${SCRIPT_PATH}'`,
-      ],
-      { stdio: "ignore", windowsHide: true, cwd: homedir() },
-    );
+    // 桌面上已经有同版本的窗口 → 不重复启动（省得单实例锁空转）
+    const inst = readInstance();
+    if (inst && inst.version === WIDGET_VERSION && isAlive(inst.pid)) {
+      log(`同版本悬浮窗已在运行 (pid=${inst.pid})，跳过启动`);
+      return "already";
+    }
+    // 走到这里说明桌面上要么没窗口、要么是旧版本（旧版本可能没有 instance.json），
+    // 一律先清掉再拉起，否则单实例互斥体会把新窗口挡掉
+    killExisting(logger);
 
-    helper.on("error", (e) => {
-      log("中转进程启动失败: " + String(e));
-      try { logger?.warn?.("[dsh-balance-widget] 启动悬浮窗失败: " + String(e)); } catch { }
-    });
-    helper.on("exit", (code) => {
-      log("已通过 Start-Process 发起启动 (中转进程 exit=" + code + ")");
-    });
+    const doSpawn = () => {
+      // 注意：不能用 node 的 detached spawn 直接启动 powershell ——
+      // Windows 上 detached 模式会让 powershell 立即静默退出(exit 0)。
+      // 改用 Start-Process 中转：由 Win32 CreateProcess 原生分离，绝对可靠。
+      const helper = spawn(
+        "powershell.exe",
+        [
+          "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+          `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList ` +
+          `'-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','${SCRIPT_PATH}'`,
+        ],
+        { stdio: "ignore", windowsHide: true, cwd: homedir() },
+      );
+
+      helper.on("error", (e) => {
+        log("中转进程启动失败: " + String(e));
+        try { logger?.warn?.("[dsh-balance-widget] 启动悬浮窗失败: " + String(e)); } catch { }
+      });
+      helper.on("exit", (code) => {
+        log("已通过 Start-Process 发起启动 (中转进程 exit=" + code + ")");
+      });
+    };
+
+    // 杀掉旧进程后留一点时间释放互斥体/文件句柄
+    setTimeout(doSpawn, 600);
+    return "launched";
   } catch (e) {
     log("异常: " + String(e));
     try { logger?.warn?.("[dsh-balance-widget] 异常: " + String(e)); } catch { }
+    return "error";
   }
 }
 
@@ -162,13 +215,15 @@ export function apply(ctx) {
       name: "widget",
       description: "打开余额悬浮窗（WorkBuddy 算力 + DeepSeek 余额）",
       handler: () => {
-        const launched = launchWidget(logger, true);
-        return {
-          kind: "success",
-          text: launched !== false
-            ? "已发起打开余额悬浮窗（若桌面未出现，查看 %LOCALAPPDATA%\\BalanceWidget\\widget.log）"
-            : "启动脚本缺失，无法打开悬浮窗",
+        const r = launchWidget(logger, true);
+        const map = {
+          launched: "正在打开余额悬浮窗（约 1 秒内出现在桌面上）",
+          already: "悬浮窗已经在桌面上运行了（单击 dsh 那一行可看用量明细）",
+          missing: "启动脚本缺失，无法打开悬浮窗",
+          error: "启动失败，查看 %LOCALAPPDATA%\\BalanceWidget\\plugin.log",
+          disabled: "已在配置里停用，但 /widget 会强制打开",
         };
+        return { kind: "success", text: map[r] || "已发起打开余额悬浮窗" };
       },
     }), "dsh-balance-widget: /widget command");
   } catch { /* 宿主不支持命令注册时静默降级 */ }
