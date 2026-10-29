@@ -14,7 +14,7 @@
  * - dsh 退出时（ctx.effect 清理）不杀悬浮窗，用户可能仍想看着余额。
  */
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,7 +34,49 @@ const USAGE_PATH = join(LOG_DIR, "usage.json");
 const INSTANCE_PATH = join(LOG_DIR, "instance.json");
 
 /** 必须与 BalanceWidget.ps1 里的 $script:widgetVersion 保持一致 */
-const WIDGET_VERSION = "1.3.0";
+const WIDGET_VERSION = "1.3.1";
+const NODE_HINT_PATH = join(LOG_DIR, "node.txt");
+
+/**
+ * 找可用的 Node：dsh 自己就是 Node 跑的，桌面上却常常没有 node（PATH 里没有）。
+ * 悬浮窗要把会话日志的 zstd 解开，必须用 Node >= 22.15。
+ */
+function resolveNode() {
+  const cands = [];
+  if (process.env.BW_NODE) cands.push(process.env.BW_NODE);
+  const base = pathBasename(process.execPath);
+  if (/^node(\.exe)?$/i.test(base)) cands.push(process.execPath);
+  // dsh 自带运行时（本机实测 v24，带 zstd）
+  for (const root of [join(homedir(), ".dsh", "dsh-runtimes"), join(homedir(), ".dsh", "runtimes")]) {
+    try {
+      for (const d of readdirSync(root, { withFileTypes: true })) {
+        if (d.isDirectory()) cands.push(join(root, d.name, "dependencies", "node", "bin", "node.exe"));
+      }
+    } catch { }
+  }
+  // 常见安装位置
+  cands.push(join(process.env.ProgramFiles || "C:\\Program Files", "nodejs", "node.exe"));
+  cands.push(join(process.env.LOCALAPPDATA || "", "Programs", "nodejs", "node.exe"));
+  // WorkBuddy / CodeBuddy 自带 node
+  try {
+    const wroot = join(homedir(), ".workbuddy", "binaries", "node", "versions");
+    for (const d of readdirSync(wroot, { withFileTypes: true })) {
+      if (d.isDirectory()) cands.push(join(wroot, d.name, "node.exe"));
+    }
+  } catch { }
+
+  for (const c of cands) {
+    try {
+      if (c && existsSync(c)) return c;
+    } catch { }
+  }
+  // 兜底：Electron 自带 node（需要 ELECTRON_RUN_AS_NODE=1）
+  return process.execPath;
+}
+
+function pathBasename(p) {
+  return String(p || "").split(/[\\/]/).pop();
+}
 
 function log(msg) {
   try {
@@ -111,6 +153,16 @@ function launchWidget(logger, force = false) {
     // 一律先清掉再拉起，否则单实例互斥体会把新窗口挡掉
     killExisting(logger);
 
+    // 把可用的 Node 路径写给悬浮窗（它自己找不到 node，PATH 里通常没有）
+    try {
+      const n = resolveNode();
+      mkdirSync(LOG_DIR, { recursive: true });
+      writeFileSync(NODE_HINT_PATH, n, "utf8");
+      log("Node 路径: " + n);
+    } catch (e) {
+      log("写 node.txt 失败: " + String(e));
+    }
+
     const doSpawn = () => {
       // 注意：不能用 node 的 detached spawn 直接启动 powershell ——
       // Windows 上 detached 模式会让 powershell 立即静默退出(exit 0)。
@@ -155,10 +207,14 @@ function scanUsage() {
       return null;
     }
     const sessionsDir = join(homedir(), ".dsh", "sessions");
-    execFileSync(process.execPath, [SCAN_PATH, sessionsDir, USAGE_PATH, "--detail"], {
+    const node = resolveNode();
+    const env = { ...process.env };
+    if (/^electron/i.test(pathBasename(node))) env.ELECTRON_RUN_AS_NODE = "1";
+    execFileSync(node, [SCAN_PATH, sessionsDir, USAGE_PATH, "--detail"], {
       windowsHide: true,
       timeout: 60000,
       stdio: "ignore",
+      env,
     });
     return JSON.parse(readFileSync(USAGE_PATH, "utf8").replace(/^\uFEFF/, ""));
   } catch (e) {
