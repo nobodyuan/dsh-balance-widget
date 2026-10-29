@@ -64,7 +64,7 @@ $autoHide = $true
 if ($null -ne $cfg.autoHide) { $autoHide = [bool]$cfg.autoHide }
 $hangPx = if ($null -ne $cfg.hangPx) { [int]$cfg.hangPx } else { 6 }
 $hideDelayMs = if ($null -ne $cfg.hideDelayMs) { [int]$cfg.hideDelayMs } else { 450 }
-$script:widgetVersion = '1.3.1'
+$script:widgetVersion = '1.3.2'
 $wbUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0'
 
 function Save-Config {
@@ -678,14 +678,22 @@ $xaml = @"
       <Grid.ColumnDefinitions><ColumnDefinition Width="62"/><ColumnDefinition/></Grid.ColumnDefinitions>
       <TextBlock Grid.Row="0" Text="WB 算力" Foreground="#A0C8C8D2" FontSize="11" VerticalAlignment="Center"/>
       <TextBlock x:Name="WbVal"  Grid.Row="0" Grid.Column="1" Text="..." FontFamily="Consolas" FontSize="17" FontWeight="Bold" VerticalAlignment="Center"/>
-      <Border x:Name="DsRow" Grid.Row="1" Grid.ColumnSpan="2" Background="Transparent" Cursor="Hand" ToolTip="单击查看每个会话/请求的 token 明细">
+      <Button x:Name="DsRow" Grid.Row="1" Grid.ColumnSpan="2" Cursor="Hand" Focusable="False" IsTabStop="False"
+              Background="Transparent" BorderThickness="0" Padding="0"
+              HorizontalContentAlignment="Stretch" VerticalContentAlignment="Center"
+              ToolTip="单击查看每个会话/请求的 token 明细">
+        <Button.Template>
+          <ControlTemplate TargetType="Button">
+            <Border Background="Transparent"><ContentPresenter/></Border>
+          </ControlTemplate>
+        </Button.Template>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width="62"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
           <TextBlock Text="dsh 余额" Foreground="#A0C8C8D2" FontSize="11" VerticalAlignment="Center"/>
           <TextBlock x:Name="DsVal" Grid.Column="1" Text="..." FontFamily="Consolas" FontSize="17" FontWeight="Bold" VerticalAlignment="Center"/>
           <TextBlock Grid.Column="2" Text="明细›" Foreground="#7A9AA8B8" FontSize="9" VerticalAlignment="Center" Margin="6,0,0,0"/>
         </Grid>
-      </Border>
+      </Button>
       <TextBlock x:Name="Status" Grid.Row="2" Grid.ColumnSpan="2" Text="初始化…" FontSize="9" Foreground="#78A0A0AA" VerticalAlignment="Bottom"/>
     </Grid>
   </Border>
@@ -696,13 +704,23 @@ $win = [Windows.Markup.XamlReader]::Parse($xaml)
 $wbVal = $win.FindName('WbVal'); $dsVal = $win.FindName('DsVal'); $status = $win.FindName('Status')
 $dsRow = $win.FindName('DsRow')
 
-# 打开明细窗口（防抖：一次点击可能被两条路径同时触发）
+# 打开明细窗口（防抖 + 延迟一帧）
+# 直接在 MouseLeftButtonDown 里 ShowDialog 会被吞：那一刻 DragMove 还握着鼠标捕获，
+# 模态窗口要么不显示要么立刻被关闭，异常又被外层 catch 吃掉。改用 Dispatcher 回调。
 $script:lastUsageOpen = [DateTime]::MinValue
 function Open-UsageOnce {
     $now = Get-Date
     if (($now - $script:lastUsageOpen).TotalMilliseconds -lt 800) { return }
     $script:lastUsageOpen = $now
-    Show-UsageWindow
+    Write-Log "请求打开用量明细"
+    try {
+        $win.Dispatcher.BeginInvoke([Action]{
+                try { Show-UsageWindow }
+                catch { Write-Log ("明细窗口异常: " + $_.Exception.Message) }
+            }) | Out-Null
+    } catch {
+        Write-Log ("调度明细窗口失败: " + $_.Exception.Message)
+    }
 }
 
 # 记住位置
@@ -886,12 +904,13 @@ $win.Add_MouseLeftButtonDown({
         if ($dx -lt 4 -and $dy -lt 4) {
             # 判定为「单击」：落点在 dsh 行内就打开用量明细
             $p = [System.Windows.Input.Mouse]::GetPosition($dsRow)
+            Write-Log ("单击判定 dx=$dx dy=$dy p=$([int]$p.X),$([int]$p.Y) row=$([int]$dsRow.ActualWidth)x$([int]$dsRow.ActualHeight)")
             if ($p.X -ge 0 -and $p.Y -ge 0 -and $p.X -le $dsRow.ActualWidth -and $p.Y -le $dsRow.ActualHeight) {
                 Open-UsageOnce
                 return
             }
         }
-    } catch { }
+    } catch { Write-Log ("单击处理异常: " + $_.Exception.Message) }
     # 拖完停在边缘 → 等鼠标离开就自动缩边
     if ($autoHide -and $script:dockSide -ne '') {
         $script:hideTimer.Stop()
@@ -908,6 +927,9 @@ $dsRow.Add_MouseLeftButtonUp({
         if ($dx2 -lt 5 -and $dy2 -lt 5) { Open-UsageOnce }
     } catch { }
 })
+
+# 主路径：dsh 行本身是个 Button，Click 由 WPF 自己保证触发（不会被 DragMove 干扰）
+$dsRow.Add_Click({ Open-UsageOnce })
 
 function Set-DsTotal {
     $cur = 0
