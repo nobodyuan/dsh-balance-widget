@@ -33,6 +33,12 @@ const PRICING = {
 };
 const DEFAULT_PRICE = PRICING["deepseek-flash"];
 
+/** 北京时间日期键 YYYY-MM-DD */
+function dayKey(ms) {
+  if (!ms) return "1970-01-01";
+  return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
 /** 北京时间是否处于高峰时段（周一至周五 9-12、14-18） */
 function isPeak(ms) {
   if (!ms) return false;
@@ -121,6 +127,7 @@ function scanFile(file) {
   const rec = {
     id: path.basename(path.dirname(file)).replace(/^session-/, ""),
     workdir: path.basename(path.dirname(path.dirname(file))).replace(/^--|--$/g, ""),
+    cwd: "",
     title: "",
     firstUser: "",
     turns: 0,
@@ -134,6 +141,7 @@ function scanFile(file) {
     firstTime: 0,
     lastTime: 0,
     models: {},
+    days: {},
     stepList: [],
   };
   let curModel = "";
@@ -153,6 +161,12 @@ function scanFile(file) {
       if (o.time > rec.lastTime) rec.lastTime = o.time;
     }
     switch (o.type) {
+      case "session": {
+        // 会话头里带真实工作目录（注意字段在记录顶层，不在 data 里）
+        const cwd = d.cwd || o.cwd;
+        if (cwd) rec.cwd = String(cwd);
+        break;
+      }
       case "session/title":
         if (d.title) rec.title = d.title;
         break;
@@ -196,6 +210,15 @@ function scanFile(file) {
         mm.cacheRead += cr;
         mm.cacheWrite += cw;
         mm.cost += c;
+        const dk = dayKey(o.time);
+        if (!rec.days[dk]) rec.days[dk] = { date: dk, steps: 0, in: 0, out: 0, cacheRead: 0, cost: 0, peakSteps: 0 };
+        const dd = rec.days[dk];
+        dd.steps++;
+        dd.in += inp;
+        dd.out += out;
+        dd.cacheRead += cr;
+        dd.cost += c;
+        if (isPeak(o.time)) dd.peakSteps++;
         rec.stepList.push({
           t: o.time || 0,
           model: mdl,
@@ -253,7 +276,71 @@ function main() {
   }
   sum.cost = Math.round(sum.cost * 100) / 100;
 
-  const payload = { at: Date.now(), sum, sessions };
+  // ---- 按天聚合 ----
+  const dayMap = new Map();
+  for (const s of sessions) {
+    for (const k of Object.keys(s.days || {})) {
+      const d = s.days[k];
+      if (!dayMap.has(k)) dayMap.set(k, { date: k, steps: 0, in: 0, out: 0, cacheRead: 0, cost: 0, peakSteps: 0 });
+      const t = dayMap.get(k);
+      t.steps += d.steps;
+      t.in += d.in;
+      t.out += d.out;
+      t.cacheRead += d.cacheRead;
+      t.cost += d.cost;
+      t.peakSteps += d.peakSteps || 0;
+    }
+  }
+  const daily = [...dayMap.values()].sort((a, b) => (a.date < b.date ? 1 : -1));
+  for (const d of daily) {
+    d.cost = Math.round(d.cost * 100) / 100;
+    d.totalTokens = d.in + d.out + d.cacheRead;
+  }
+
+  // ---- 按模型聚合 ----
+  const modelMap = new Map();
+  for (const s of sessions) {
+    for (const k of Object.keys(s.models || {})) {
+      const m = s.models[k];
+      if (!modelMap.has(k)) modelMap.set(k, { model: k, steps: 0, in: 0, out: 0, cacheRead: 0, cost: 0 });
+      const t = modelMap.get(k);
+      t.steps += m.n;
+      t.in += m.in;
+      t.out += m.out;
+      t.cacheRead += m.cacheRead;
+      t.cost += m.cost;
+    }
+  }
+  const models = [...modelMap.values()].sort((a, b) => b.cost - a.cost);
+  for (const m of models) {
+    m.cost = Math.round(m.cost * 100) / 100;
+    m.totalTokens = m.in + m.out + m.cacheRead;
+  }
+
+  // ---- 按工作区聚合 ----
+  const wsMap = new Map();
+  for (const s of sessions) {
+    const key = s.cwd || s.workdir || "(未知)";
+    if (!wsMap.has(key)) wsMap.set(key, { workdir: key, sessions: 0, steps: 0, tokens: 0, cost: 0, lastTime: 0 });
+    const t = wsMap.get(key);
+    t.sessions++;
+    t.steps += s.steps;
+    t.tokens += s.totalTokens;
+    t.cost += s.cost;
+    if (s.lastTime > t.lastTime) t.lastTime = s.lastTime;
+  }
+  const workspaces = [...wsMap.values()].sort((a, b) => b.cost - a.cost);
+  for (const w of workspaces) w.cost = Math.round(w.cost * 100) / 100;
+
+  // ---- 今日 ----
+  const today = dayKey(Date.now());
+  const td = dayMap.get(today) || { steps: 0, in: 0, out: 0, cacheRead: 0, cost: 0 };
+  sum.today = today;
+  sum.todayCost = Math.round((td.cost || 0) * 100) / 100;
+  sum.todaySteps = td.steps || 0;
+  sum.todayTokens = (td.in || 0) + (td.out || 0) + (td.cacheRead || 0);
+
+  const payload = { at: Date.now(), sum, daily, models, workspaces, sessions };
   if (!wantDetail) for (const s of sessions) delete s.stepList;
   const json = JSON.stringify(payload);
   if (outPath) {
