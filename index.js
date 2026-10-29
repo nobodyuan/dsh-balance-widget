@@ -34,7 +34,7 @@ const USAGE_PATH = join(LOG_DIR, "usage.json");
 const INSTANCE_PATH = join(LOG_DIR, "instance.json");
 
 /** 必须与 BalanceWidget.ps1 里的 $script:widgetVersion 保持一致 */
-const WIDGET_VERSION = "1.3.1";
+const WIDGET_VERSION = "1.3.2";
 const NODE_HINT_PATH = join(LOG_DIR, "node.txt");
 
 /**
