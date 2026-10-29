@@ -4,12 +4,16 @@
  * 作用：dsh desktop profile 启动（即桌宠 dsh-pet 出现）时，把余额悬浮窗一并拉起。
  * 不写任何开机启动项、不注册计划任务；dsh 不启动时悬浮窗也不会自己出现。
  *
+ * 命令：
+ *   /widget  打开余额悬浮窗（无视 enabled 开关）
+ *   /usage   在输入区直接打印 dsh 累计 token 消耗 / 估算花费 / 各会话明细
+ *
  * 设计要点：
  * - 全程 try/catch，任何失败都不影响 dsh / 桌宠正常启动；
  * - 悬浮窗脚本自身带命名互斥体单实例保护，多次启动不会出现重复窗口；
  * - dsh 退出时（ctx.effect 清理）不杀悬浮窗，用户可能仍想看着余额。
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -20,10 +24,13 @@ export const name = "dsh-balance-widget";
 /** 无强依赖：即使宿主没提供任何服务，本插件也能独立完成启动动作 */
 export const inject = [];
 
-// 自包含：悬浮窗脚本随插件分发，路径相对插件目录解析
-const SCRIPT_PATH = join(dirname(fileURLToPath(import.meta.url)), "BalanceWidget.ps1");
+const HERE = dirname(fileURLToPath(import.meta.url));
+// 自包含：悬浮窗脚本与用量扫描器随插件分发，路径相对插件目录解析
+const SCRIPT_PATH = join(HERE, "BalanceWidget.ps1");
+const SCAN_PATH = join(HERE, "usage-scan.cjs");
 const LOG_DIR = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "BalanceWidget");
 const LOG_PATH = join(LOG_DIR, "plugin.log");
+const USAGE_PATH = join(LOG_DIR, "usage.json");
 
 function log(msg) {
   try {
@@ -32,30 +39,30 @@ function log(msg) {
   } catch { }
 }
 
+function readEnabled() {
+  const cfgPath = join(LOG_DIR, "config.json");
+  if (!existsSync(cfgPath)) return true;
+  try {
+    // PowerShell 写出的 UTF-8 带 BOM，必须先剥离再 JSON.parse
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, ""));
+    return cfg.enabled !== false;
+  } catch (e) {
+    log("读取开关配置失败，按默认开启处理: " + String(e));
+    return true;
+  }
+}
+
 function launchWidget(logger, force = false) {
   try {
     if (!existsSync(SCRIPT_PATH)) {
       log("脚本不存在，跳过: " + SCRIPT_PATH);
       return false;
     }
-
     // 用户开关：config.json 的 enabled 字段（悬浮窗右键「停用跟随启动」写入）
     // /widget 手动命令带 force=true，无视开关直接打开
-    if (!force) {
-      const cfgPath = join(LOG_DIR, "config.json");
-      if (existsSync(cfgPath)) {
-        try {
-          // PowerShell 写出的 UTF-8 带 BOM，必须先剥离再 JSON.parse
-          const raw = readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, "");
-          const cfg = JSON.parse(raw);
-          if (cfg.enabled === false) {
-            log("开关为关 (enabled=false)，跳过自动启动。可用 /widget 命令手动打开");
-            return false;
-          }
-        } catch (e) {
-          log("读取开关配置失败，按默认开启处理: " + String(e));
-        }
-      }
+    if (!force && !readEnabled()) {
+      log("开关为关 (enabled=false)，跳过自动启动。可用 /widget 命令手动打开");
+      return false;
     }
 
     // 注意：不能用 node 的 detached spawn 直接启动 powershell ——
@@ -84,6 +91,53 @@ function launchWidget(logger, force = false) {
   }
 }
 
+const n0 = (v) => Number(v || 0).toLocaleString("zh-CN");
+const money = (v) => "¥" + Number(v || 0).toFixed(2);
+
+/** 扫描本地会话日志，返回用量统计（失败返回 null） */
+function scanUsage() {
+  try {
+    if (!existsSync(SCAN_PATH)) {
+      log("用量扫描器缺失: " + SCAN_PATH);
+      return null;
+    }
+    const sessionsDir = join(homedir(), ".dsh", "sessions");
+    execFileSync(process.execPath, [SCAN_PATH, sessionsDir, USAGE_PATH, "--detail"], {
+      windowsHide: true,
+      timeout: 60000,
+      stdio: "ignore",
+    });
+    return JSON.parse(readFileSync(USAGE_PATH, "utf8").replace(/^\uFEFF/, ""));
+  } catch (e) {
+    log("用量扫描失败: " + String(e));
+    return null;
+  }
+}
+
+function usageText() {
+  const d = scanUsage();
+  if (!d || !d.sum) return "读不到 dsh 会话日志（需要 Node 22+ 解压 ~/.dsh/sessions）";
+  const s = d.sum;
+  const lines = [];
+  lines.push(`dsh 累计用量（本地会话日志估算）`);
+  lines.push(`花费 ${money(s.cost)} · tokens ${n0(s.totalTokens)} · 请求 ${n0(s.steps)} 次 · 会话 ${n0(s.usedSessions)} 个`);
+  lines.push(`输入 ${n0(s.inputTokens)}（缓存命中 ${n0(s.cacheReadTokens)}）· 输出 ${n0(s.outputTokens)}`);
+
+  const rows = (d.sessions || []).filter((x) => x.steps > 0).slice(0, 10);
+  if (rows.length) {
+    lines.push("");
+    lines.push("最近消耗 top10：");
+    rows.forEach((x, i) => {
+      const t = x.lastTime ? new Date(x.lastTime).toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "--";
+      const task = (x.firstUser || x.title || "(未命名会话)").slice(0, 34);
+      lines.push(`${i + 1}. ${t}  ${money(x.cost)}  ${x.steps}次  ${task}`);
+    });
+  }
+  lines.push("");
+  lines.push("费用按 DeepSeek 官方峰谷价估算，仅供参考；精确账单看 platform.deepseek.com。");
+  return lines.join("\n");
+}
+
 export function apply(ctx) {
   const logger = ctx?.logger;
 
@@ -104,6 +158,15 @@ export function apply(ctx) {
       },
     }), "dsh-balance-widget: /widget command");
   } catch { /* 宿主不支持命令注册时静默降级 */ }
+
+  // 注册 /usage 斜杠命令：直接在对话里输出 token 消耗明细
+  try {
+    ctx?.effect?.(() => ctx?.commands?.register({
+      name: "usage",
+      description: "查看 dsh 累计 token 消耗与估算花费（按会话/请求）",
+      handler: () => ({ kind: "success", text: usageText() }),
+    }), "dsh-balance-widget: /usage command");
+  } catch { }
 
   log("插件已加载，3 秒后启动悬浮窗");
 
